@@ -32,7 +32,9 @@ z_fixed = -2797.85  # 无人机高度固定为200
 tank_height = -2910.1  # 坦克高度
 # 最大允许的水平距离（防止角度逼近0导致的爆炸式距离）
 MAX_HORIZ_DIST = 10000.0
-DRONE_COUNT = 2
+CONTROLLED_DRONE_COUNT = 2
+CONSTRAINT_DRONE_COUNT = 3
+DRONE_COUNT = CONTROLLED_DRONE_COUNT
 
 
 def estimate_tank_from_detections(drones: List[Tuple[float, float, float, float, float]]):
@@ -179,7 +181,7 @@ class DroneWebSocketServer:
         self.detector = YOLO("F:/Platform/Server/detec/best.pt")
 
     def HandleRequestFunc(self, image_1, image_2, drone_1_location, drone_2_location,
-                          drone_1_angle, drone_2_angle, tank_location):
+                          drone_1_angle, drone_2_angle, tank_location, constraint_drone_locations=None):
         """
         处理请求的核心函数
 
@@ -206,13 +208,13 @@ class DroneWebSocketServer:
         print('Real tank XY from platform is ', tank_location[0], tank_location[1])
         if predict_tank_location is None or math.sqrt(((predict_tank_location[0] - tank_location[0]) ** 2 + (predict_tank_location[1] - tank_location[1]) ** 2)) > 300:
             # 如果没有检测到坦克，使用原来的坦克位置
-            result = self.path(drone_1_location, drone_2_location, tank_location)
+            result = self.path(drone_1_location, drone_2_location, tank_location, constraint_drone_locations)
         else:
             # 使用检测到的坦克位置
             x_tank, y_tank = predict_tank_location
             # 保持原来的z坐标
             new_tank_location = [x_tank, y_tank, tank_location[2]]
-            result = self.path(drone_1_location, drone_2_location, new_tank_location)
+            result = self.path(drone_1_location, drone_2_location, new_tank_location, constraint_drone_locations)
             print('sunhongze=sunhongze=sunhongze=sunhongze=sunhongze=sunhongze')
         ###################################sunhongze###################################
         logger.info(f"New drone positions and angles: {result}")
@@ -231,9 +233,10 @@ class DroneWebSocketServer:
 
     def parse_drone_group_data(self, data: Dict[str, Any]) -> Tuple[List[Image.Image], List[List[float]], List[float]]:
         """解析无人机组数据"""
-        images = [None] * DRONE_COUNT
-        drone_locations = [None] * DRONE_COUNT
-        drone_rotations = [None] * DRONE_COUNT
+        images = [None] * CONTROLLED_DRONE_COUNT
+        drone_locations = [None] * CONSTRAINT_DRONE_COUNT
+        drone_rotations = [None] * CONTROLLED_DRONE_COUNT
+        drone_location_valid = [False] * CONSTRAINT_DRONE_COUNT
         tank_location = None
 
         try:
@@ -247,25 +250,26 @@ class DroneWebSocketServer:
                 for drone_data in data['drones']:
                     drone_id = drone_data.get('drone_id', 0)
 
-                    if 0 <= drone_id < DRONE_COUNT:  # 确保drone_id在有效范围内
+                    if 0 <= drone_id < CONSTRAINT_DRONE_COUNT:  # 确保drone_id在有效范围内
                         # 解析位置
                         if 'position' in drone_data:
                             pos = drone_data['position']
                             drone_locations[drone_id] = [pos['x'], pos['y'], pos['z']]
+                            drone_location_valid[drone_id] = True
 
-                        # 解析角度
-                        if 'angle' in drone_data:
+                        # 只解析需要控制的无人机角度和图像
+                        if drone_id < CONTROLLED_DRONE_COUNT and 'angle' in drone_data:
                             drone_rotations[drone_id] = drone_data['angle']
 
-                        # 解析图像
-                        if 'image' in drone_data and 'data' in drone_data['image']:
+                        if drone_id < CONTROLLED_DRONE_COUNT and 'image' in drone_data and 'data' in drone_data['image']:
                             base64_data = drone_data['image']['data']
                             images[drone_id] = self.base64_to_image(base64_data)
 
             # 填充缺失的数据为默认值
-            for i in range(DRONE_COUNT):
+            for i in range(CONSTRAINT_DRONE_COUNT):
                 if drone_locations[i] is None:
                     drone_locations[i] = [0.0, 0.0, 0.0]
+            for i in range(CONTROLLED_DRONE_COUNT):
                 if images[i] is None:
                     # 创建一个空的1x1像素图像作为占位符
                     images[i] = Image.new('RGB', (1, 1), color='black')
@@ -278,12 +282,13 @@ class DroneWebSocketServer:
         except Exception as e:
             logger.error(f"Error parsing drone group data: {e}")
             # 返回默认值
-            images = [Image.new('RGB', (1, 1), color='black') for _ in range(DRONE_COUNT)]
-            drone_locations = [[0.0, 0.0, 0.0] for _ in range(DRONE_COUNT)]
-            drone_rotations = [0.0 for _ in range(DRONE_COUNT)]
+            images = [Image.new('RGB', (1, 1), color='black') for _ in range(CONTROLLED_DRONE_COUNT)]
+            drone_locations = [[0.0, 0.0, 0.0] for _ in range(CONSTRAINT_DRONE_COUNT)]
+            drone_rotations = [0.0 for _ in range(CONTROLLED_DRONE_COUNT)]
+            drone_location_valid = [False] * CONSTRAINT_DRONE_COUNT
             tank_location = [0.0, 0.0, 0.0]
 
-        return images, drone_locations, drone_rotations, tank_location
+        return images, drone_locations, drone_rotations, tank_location, drone_location_valid
 
     async def handle_client(self, websocket):
         """处理客户端连接"""
@@ -299,14 +304,20 @@ class DroneWebSocketServer:
 
                     if message_type == 'drone_group_data':
                         # 解析无人机组数据
-                        images, drone_locations, drone_angles, tank_location = self.parse_drone_group_data(data)
+                        images, drone_locations, drone_angles, tank_location, drone_location_valid = self.parse_drone_group_data(data)
+                        constraint_drone_locations = [
+                            drone_locations[i]
+                            for i in range(CONTROLLED_DRONE_COUNT, CONSTRAINT_DRONE_COUNT)
+                            if drone_location_valid[i]
+                        ]
 
                         # 调用处理函数
                         pathresult = self.HandleRequestFunc(
                             images[0], images[1],
                             drone_locations[0], drone_locations[1],
                             drone_angles[0], drone_angles[1],
-                            tank_location
+                            tank_location,
+                            constraint_drone_locations
                         )
 
                         # 构建响应消息
@@ -381,7 +392,7 @@ class DroneWebSocketServer:
         asyncio.get_event_loop().run_forever()
 
     ###################################sunhongze###################################
-    def path(self, drone_1_location, drone_2_location, tank_location):
+    def path(self, drone_1_location, drone_2_location, tank_location, constraint_drone_locations=None):
         """
         输入与输出格式保持原样。
         主要流程：
@@ -389,12 +400,22 @@ class DroneWebSocketServer:
         2) 调用 controller.compute_control 得到期望速度向量
         3) 通过 dt 计算新位置
         4) 后处理：保证 inter-UAV >=200、UAV->tank <800（尽量）、并验证可视性（若不可见尝试小幅移动以进入视野）
+
+        constraint_drone_locations 可传入不受本服务控制、但需要参与避让约束的无人机位置。
+        当前版本用它让第三架无人机参与位置约束，但最终仍只返回前两架的控制结果。
         """
         # 1. 组装数据
+        controlled_locations = [drone_1_location, drone_2_location]
+        constraint_drone_locations = constraint_drone_locations or []
         uavs_2d = [
             (drone_1_location[0], drone_1_location[1]),
             (drone_2_location[0], drone_2_location[1])
         ]
+        constraint_uavs_2d = [
+            (location[0], location[1])
+            for location in constraint_drone_locations
+        ]
+        all_uavs_2d = uavs_2d + constraint_uavs_2d
         tank_2d = (tank_location[0], tank_location[1])
 
         # 2. 坦克速度估计（使用历史）
@@ -418,14 +439,14 @@ class DroneWebSocketServer:
         if len(self.tank_velocity_history) > 40:
             self.tank_velocity_history.pop(0)
 
-        # 3. 调用控制器得到速度向量
-        controls = self.controller.compute_control(uavs_2d, tank_2d, tank_velocity)
+        # 3. 调用控制器得到速度向量。第三架无人机只参与约束，后续只使用前两架控制量。
+        controls = self.controller.compute_control(all_uavs_2d, tank_2d, tank_velocity)[:CONTROLLED_DRONE_COUNT]
 
         # 4. 基于 dt 计算新位置（并进行后处理）
         dt = 0.25  # 时间步长，可调
         proposed_positions = []
         for i, (vx, vy) in enumerate(controls):
-            current_location = [drone_1_location, drone_2_location][i]
+            current_location = controlled_locations[i]
             new_x = current_location[0] + vx * dt
             new_y = current_location[1] + vy * dt
             new_z = current_location[2]
@@ -441,10 +462,11 @@ class DroneWebSocketServer:
         #    同时，尝试让每架无人机能“看到”坦克（若无法，则以最小移动朝向使其进入横向 FOV）
         #    并尽量保证 UAV->tank 距离 < 800（如果当前距>800则优先靠近）
         final_positions = proposed_positions.copy()
+        fixed_constraint_positions = [location[:2] for location in constraint_drone_locations]
         # 多轮修正（最多三轮）
         for _iter in range(3):
             changed = False
-            # 检查间距
+            # 检查受控无人机之间的间距
             drone_count = len(final_positions)
             for i in range(drone_count):
                 for j in range(i + 1, drone_count):
@@ -464,6 +486,23 @@ class DroneWebSocketServer:
                         final_positions[i][1] += move[1]
                         final_positions[j][0] -= move[0]
                         final_positions[j][1] -= move[1]
+                        changed = True
+
+            # 检查受控无人机与第三架固定无人机之间的间距。
+            for i in range(drone_count):
+                pi = np.array(final_positions[i][:2])
+                for fixed_position in fixed_constraint_positions:
+                    pj = np.array(fixed_position)
+                    dist = np.linalg.norm(pi - pj)
+                    if dist < self.controller.min_inter_uav:
+                        overlap = self.controller.min_inter_uav - dist + 1e-3
+                        direction = pi - pj
+                        if np.linalg.norm(direction) < 1e-6:
+                            direction = np.random.rand(2) - 0.5
+                        direction = direction / (np.linalg.norm(direction) + 1e-6)
+                        move = direction * overlap
+                        final_positions[i][0] += move[0]
+                        final_positions[i][1] += move[1]
                         changed = True
 
             # 检查到坦克距离与可视性（相机参数来自文件头）
