@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "research-paper-writer": {
+      "name": "Research Paper Writer",
+      "zip_url": "https://lightmake.site/api/v1/download?slug=research-paper-writer",
+      "source": "skillhub",
+      "version": "0.1.0"
+    }
+  }
+}
